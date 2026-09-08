@@ -5,9 +5,15 @@ on:
     branches:
       - main
 
+concurrency:
+  group: admin-fe-ec2-deploy
+  cancel-in-progress: false
+
 jobs:
   validate:
     runs-on: ubuntu-latest
+    env:
+      NEXT_PUBLIC_API_BASE_URL: https://ci.example.com/api/v1
     steps:
       - uses: actions/checkout@v4
 
@@ -21,7 +27,7 @@ jobs:
         run: npm ci
 
       - name: Lint
-        run: npm run lint
+        run: npx eslint . --max-warnings 0
 
       - name: Build
         run: npm run build
@@ -29,6 +35,7 @@ jobs:
   deploy:
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     environment: production
     steps:
       - uses: actions/checkout@v4
@@ -38,7 +45,7 @@ jobs:
           if [ -z "${{ secrets.EC2_HOST }}" ] || \
              [ -z "${{ secrets.EC2_SSH_KEY }}" ] || \
              [ -z "${{ secrets.EC2_USER }}" ]; then
-            echo "One or more required secrets are empty or not set (EC2_HOST, EC2_SSH_KEY, EC2_USER)"
+            echo "Missing SSH secrets: set EC2_HOST, EC2_USER, EC2_SSH_KEY in the production environment"
             exit 1
           fi
 
@@ -47,20 +54,97 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+          cat >> ~/.ssh/config << 'CFG'
+          Host *
+            ServerAliveInterval 15
+            ServerAliveCountMax 120
+            TCPKeepAlive yes
+          CFG
 
       - name: Add EC2 host to known_hosts
         run: |
-          ssh-keyscan -t ed25519 -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+          HOST="${{ secrets.EC2_HOST }}"
+          success=false
+          for attempt in 1 2 3 4 5; do
+            if ssh-keyscan -T 20 -t ed25519,ecdsa,rsa -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null; then
+              success=true
+              break
+            fi
+            echo "ssh-keyscan attempt $attempt failed, retrying..."
+            sleep 5
+          done
+          if [ "$success" != "true" ]; then
+            echo "ssh-keyscan failed for host (check EC2_HOST and EC2 security group port 22)"
+            exit 1
+          fi
 
-      - name: Build & Deploy
+      - name: Blue-green deploy Admin FE on EC2
         run: |
-          ssh -i ~/.ssh/id_ed25519 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-            cd grubadmin-frontend
-            git stash
+          ssh -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=120 \
+            -i ~/.ssh/id_ed25519 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            set -euo pipefail
+            BG_SCRIPT="/home/ubuntu/scripts/bluegreen-prod-admin-fe.sh"
+            if [ ! -x "$BG_SCRIPT" ]; then
+              echo "Missing $BG_SCRIPT — sync from GrubAdmin-Backend scripts/ec2/ first"
+              exit 1
+            fi
+
+            INACTIVE_COLOR="$("$BG_SCRIPT" inactive-color)"
+            INACTIVE_PORT="$("$BG_SCRIPT" inactive-port)"
+            INACTIVE_PROJECT="$("$BG_SCRIPT" inactive-project)"
+            INACTIVE_CONTAINER="$("$BG_SCRIPT" inactive-container)"
+            ACTIVE_COLOR="$("$BG_SCRIPT" active-color)"
+
+            echo "=== Admin FE blue-green: candidate=${INACTIVE_COLOR} port=${INACTIVE_PORT} project=${INACTIVE_PROJECT} ==="
+            echo "=== Active until cutover: ${ACTIVE_COLOR} ==="
+
+            cd /home/ubuntu/grubadmin-frontend
+            git stash || true
             git pull origin main
-            docker compose -f docker-compose.frontend.yml down
-            docker compose -f docker-compose.frontend.yml up --build -d
+
+            LOG=/tmp/fe-deploy-prod-bg.log
+            PIDFILE=/tmp/fe-deploy-prod-bg.pid
+            rm -f "$LOG" "$PIDFILE"
+
+            nohup bash -c "
+              set -euo pipefail
+              cd /home/ubuntu/grubadmin-frontend
+              export FE_CONTAINER_NAME=${INACTIVE_CONTAINER}
+              export FE_HOST_PORT=${INACTIVE_PORT}
+              export DOCKER_BUILDKIT=1
+              export COMPOSE_DOCKER_CLI_BUILD=1
+              docker compose -p ${INACTIVE_PROJECT} -f docker-compose.frontend.yml build
+              docker compose -p ${INACTIVE_PROJECT} -f docker-compose.frontend.yml up -d
+            " > "$LOG" 2>&1 &
+            echo $! > "$PIDFILE"
+            echo "Candidate build started (pid $(cat "$PIDFILE"))"
+
+            # Wait for candidate HTTP (up to ~10 min)
+            ready=false
+            for i in $(seq 1 40); do
+              if curl -sf "http://127.0.0.1:${INACTIVE_PORT}/" >/dev/null; then
+                ready=true
+                break
+              fi
+              if test -f "$PIDFILE" && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+                echo "build still running (attempt $i)..."
+              else
+                echo "deploy script finished, waiting for candidate HTTP (attempt $i)..."
+              fi
+              sleep 15
+            done
+            if [ "$ready" != "true" ]; then
+              echo "Candidate Admin FE health failed on :${INACTIVE_PORT}"
+              tail -100 "$LOG" || true
+              docker logs "$INACTIVE_CONTAINER" --tail 50 || true
+              exit 1
+            fi
+
+            "$BG_SCRIPT" cutover "$INACTIVE_COLOR"
+            echo "=== Keep previous slot as warm standby (no stop) ==="
+            "$BG_SCRIPT" status
+            echo "=== Admin FE blue-green deploy complete ==="
           EOF
 
       - name: Done
-        run: echo "Admin frontend deployed successfully to production"
+        run: echo "Admin frontend blue-green deployed successfully to production"

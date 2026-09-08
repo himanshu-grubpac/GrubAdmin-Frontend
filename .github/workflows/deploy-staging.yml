@@ -5,9 +5,15 @@ on:
     branches:
       - staging
 
+concurrency:
+  group: admin-fe-ec2-deploy
+  cancel-in-progress: false
+
 jobs:
   validate:
     runs-on: ubuntu-latest
+    env:
+      NEXT_PUBLIC_API_BASE_URL: https://ci.example.com/api/v1
     steps:
       - uses: actions/checkout@v4
 
@@ -21,7 +27,7 @@ jobs:
         run: npm ci
 
       - name: Lint
-        run: npm run lint
+        run: npx eslint . --max-warnings 0
 
       - name: Build
         run: npm run build
@@ -29,6 +35,7 @@ jobs:
   deploy:
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     environment: staging
     steps:
       - uses: actions/checkout@v4
@@ -36,9 +43,12 @@ jobs:
       - name: Check staging slot configured
         id: slot
         run: |
-          if [ -z "${{ secrets.STAGING_DEPLOY_PATH }}" ]; then
+          if [ -z "${{ secrets.STAGING_DEPLOY_PATH }}" ] || \
+             [ -z "${{ secrets.EC2_HOST }}" ] || \
+             [ -z "${{ secrets.EC2_SSH_KEY }}" ] || \
+             [ -z "${{ secrets.EC2_USER }}" ]; then
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Staging slot not configured::STAGING_DEPLOY_PATH secret not set — CI gate passed; SSH deploy skipped until staging slot is ready on EC2."
+            echo "::notice title=Staging slot not configured::Set STAGING_DEPLOY_PATH, EC2_HOST, EC2_USER, EC2_SSH_KEY in the staging environment."
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
@@ -49,22 +59,80 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+          cat >> ~/.ssh/config << 'CFG'
+          Host *
+            ServerAliveInterval 15
+            ServerAliveCountMax 120
+            TCPKeepAlive yes
+          CFG
 
       - name: Add EC2 host to known_hosts
         if: steps.slot.outputs.configured == 'true'
         run: |
-          ssh-keyscan -t ed25519 -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+          HOST="${{ secrets.EC2_HOST }}"
+          success=false
+          for attempt in 1 2 3 4 5; do
+            if ssh-keyscan -T 20 -t ed25519,ecdsa,rsa -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null; then
+              success=true
+              break
+            fi
+            echo "ssh-keyscan attempt $attempt failed, retrying..."
+            sleep 5
+          done
+          if [ "$success" != "true" ]; then
+            echo "ssh-keyscan failed for host (check EC2_HOST and EC2 security group port 22)"
+            exit 1
+          fi
 
-      - name: Build & Deploy to staging slot
+      - name: Start build on EC2 (detached)
         if: steps.slot.outputs.configured == 'true'
         run: |
-          ssh -i ~/.ssh/id_ed25519 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << EOF
+          ssh -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=120 \
+            -i ~/.ssh/id_ed25519 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << EOF
+            set -e
             cd ${{ secrets.STAGING_DEPLOY_PATH }}
             git stash
             git pull origin staging
-            docker compose -f docker-compose.frontend.yml down
-            docker compose -f docker-compose.frontend.yml up --build -d
+            LOG=/tmp/fe-deploy-staging.log
+            PIDFILE=/tmp/fe-deploy-staging.pid
+            rm -f "\$LOG" "\$PIDFILE"
+            nohup bash -c '
+              set -e
+              cd ${{ secrets.STAGING_DEPLOY_PATH }}
+              export FE_CONTAINER_NAME=grub-admin-frontend-staging
+              export FE_HOST_PORT=3001
+              export DOCKER_BUILDKIT=1
+              export COMPOSE_DOCKER_CLI_BUILD=1
+              docker compose -p grubadmin-fe-staging -f docker-compose.frontend.yml build
+              docker compose -p grubadmin-fe-staging -f docker-compose.frontend.yml up -d
+            ' > "\$LOG" 2>&1 &
+            echo \$! > "\$PIDFILE"
+            echo "Deploy started (pid \$(cat "\$PIDFILE"))"
           EOF
+
+      - name: Wait for frontend ready
+        if: steps.slot.outputs.configured == 'true'
+        run: |
+          SSH="ssh -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=120 -i ~/.ssh/id_ed25519 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}"
+          ready=false
+          for i in $(seq 1 40); do
+            if $SSH "curl -sf http://127.0.0.1:3001/ >/dev/null"; then
+              ready=true
+              break
+            fi
+            if $SSH "test -f /tmp/fe-deploy-staging.pid && kill -0 \$(cat /tmp/fe-deploy-staging.pid) 2>/dev/null"; then
+              echo "build still running (attempt $i)..."
+            else
+              echo "deploy script finished, waiting for frontend HTTP (attempt $i)..."
+            fi
+            sleep 15
+          done
+          if [ "$ready" != "true" ]; then
+            echo "frontend health check failed on port 3001"
+            $SSH "tail -100 /tmp/fe-deploy-staging.log" || true
+            $SSH "docker logs grub-admin-frontend-staging --tail 50" || true
+            exit 1
+          fi
 
       - name: Done
         if: steps.slot.outputs.configured == 'true'

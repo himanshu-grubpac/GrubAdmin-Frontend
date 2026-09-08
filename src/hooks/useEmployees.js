@@ -97,6 +97,7 @@ export function useEmployees(params = {}) {
 
   useEffect(() => {
     mountedRef.current = true;
+    const fetchIdRefAtMount = fetchIdRef;
 
     const cached = store.getCache();
     if (cached && cached.paramsKey === paramsKey && !store.isStale()) {
@@ -117,7 +118,7 @@ export function useEmployees(params = {}) {
 
     return () => {
       mountedRef.current = false;
-      ++fetchIdRef.current;
+      fetchIdRefAtMount.current += 1;
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 

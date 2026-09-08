@@ -1,14 +1,16 @@
 services:
   frontend:
-    container_name: grub-admin-frontend
+    container_name: ${FE_CONTAINER_NAME:-grub-admin-frontend}
     build:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:${FE_HOST_PORT:-3000}:3000"
     env_file:
       - .env.production
+    environment:
+      - HOSTNAME=0.0.0.0
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/"]
       interval: 30s
@@ -16,9 +18,8 @@ services:
       retries: 3
       start_period: 15s
     networks:
-      - grubadmin-network
+      - frontend-network
 
 networks:
-  grubadmin-network:
+  frontend-network:
     driver: bridge
-    name: grubadmin-network
