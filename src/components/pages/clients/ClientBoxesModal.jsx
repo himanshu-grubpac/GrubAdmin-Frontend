@@ -27,10 +27,13 @@ const ClientBoxesModal = ({ open, onClose, clientId, clientName }) => {
     setLoading(true);
     setError(null);
     try {
-      const response = await boxService.getBoxes({ client_id: clientId });
+      const response = await boxService.getBoxes({
+        client_id: clientId,
+        page_number: 1,
+        page_size: 100,
+      });
       if (response?.success && response?.code === 200) {
-        const allBoxes = response.data?.boxes || [];
-        setBoxes(allBoxes.filter((b) => b.client_id === clientId));
+        setBoxes(response.data?.boxes || []);
       } else {
         setError("Failed to load boxes.");
       }
